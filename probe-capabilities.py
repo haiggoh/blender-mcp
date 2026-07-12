@@ -248,6 +248,16 @@ def cleanup(obj_names, mat_names):
         "    if mm:\n"
         "        mm.use_fake_user = False\n"
         "        bpy.data.materials.remove(mm)\n"
+        # also purge orphaned image datablocks the download created (collect names first to
+        # avoid StructRNA-invalidation while iterating and removing).
+        f"prefixes = tuple({mat_names!r})\n"
+        "if prefixes:\n"
+        "    orphan = [i.name for i in bpy.data.images if i.users == 0 and i.name.startswith(prefixes)]\n"
+        "    for nm in orphan:\n"
+        "        im = bpy.data.images.get(nm)\n"
+        "        if im:\n"
+        "            im.use_fake_user = False\n"
+        "            bpy.data.images.remove(im)\n"
         "print('CLEANED')\n"
     )
     out = bl(code)
@@ -384,6 +394,9 @@ def run_probe():
             ok_st, payload_st, raw_st = call("set_texture",
                                              {"object_name": "ASSERT_PLANE", "texture_id": asset},
                                              timeout=45)
+            # set_texture creates its own material (<texture_id>_material_<object_name>) even on
+            # the old error path — track it so cleanup removes it too.
+            created_mats.append(f"{asset}_material_ASSERT_PLANE")
             sep_out = bl(
                 "import bpy\n"
                 "o = bpy.data.objects.get('ASSERT_PLANE')\n"
