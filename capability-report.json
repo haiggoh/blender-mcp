@@ -19,7 +19,7 @@
     {
       "command": "get_viewport_screenshot",
       "status": "WORKS",
-      "detail": "inline image=True base64_len=61876 (want image >1KB)"
+      "detail": "inline image=True base64_len=62008 (want image >1KB)"
     },
     {
       "command": "get_polyhaven_status",
