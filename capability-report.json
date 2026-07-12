@@ -1,0 +1,59 @@
+{
+  "blender_version": "5.1.2",
+  "results": [
+    {
+      "command": "get_scene_info",
+      "status": "WORKS",
+      "detail": "reported object_count=3 vs measured=3"
+    },
+    {
+      "command": "execute_blender_code",
+      "status": "WORKS",
+      "detail": "object count 3->4 (expected +1); named ASSERT_CUBE"
+    },
+    {
+      "command": "get_object_info",
+      "status": "WORKS",
+      "detail": "ASSERT_CUBE type=MESH (want MESH); missing-name errored=True"
+    },
+    {
+      "command": "get_viewport_screenshot",
+      "status": "WORKS",
+      "detail": "inline image=True base64_len=61980 (want image >1KB)"
+    },
+    {
+      "command": "get_polyhaven_status",
+      "status": "WORKS",
+      "detail": "reported_enabled=True vs live_toggle=True"
+    },
+    {
+      "command": "download_polyhaven_asset",
+      "status": "WORKS",
+      "detail": "material 'dark_wood' created=True, TEX_IMAGE nodes=7"
+    },
+    {
+      "command": "set_texture",
+      "status": "FIXED-PENDING-RELOAD",
+      "detail": "running add-on still executes old code (ShaderNodeSeparateRGB error), but the fix IS present in addon.py on disk \u2014 reload the add-on to activate. Fix itself verified separately via direct node-logic execution (see PR #280)."
+    },
+    {
+      "command": "get_hyper3d_status",
+      "status": "WORKS",
+      "detail": "reported_enabled=False vs live_toggle=False"
+    },
+    {
+      "command": "get_sketchfab_status",
+      "status": "WORKS",
+      "detail": "reported_enabled=False vs live_toggle=False"
+    },
+    {
+      "command": "get_hunyuan3d_status",
+      "status": "WORKS",
+      "detail": "reported_enabled=False vs live_toggle=False"
+    }
+  ],
+  "summary": {
+    "WORKS": 9,
+    "FIXED-PENDING-RELOAD": 1
+  }
+}
