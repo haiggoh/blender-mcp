@@ -5,8 +5,9 @@ import json
 import asyncio
 import logging
 import tempfile
-from dataclasses import dataclass
-from contextlib import asynccontextmanager
+import threading
+from dataclasses import dataclass, field
+from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator, Dict, Any, List
 import os
 import sys
@@ -17,6 +18,7 @@ from urllib.parse import urlparse
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, EventType
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
+from .socket_framing import pack_json_message, receive_framed_bytes
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -27,12 +29,29 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
+
+class BlenderCommandError(Exception):
+    """Blender addon returned status=error. Socket is still healthy."""
+
+
+def _is_valid_http_url(value: str) -> bool:
+    """True when value is an absolute HTTP(S) URL with a host."""
+    if not isinstance(value, str) or not value:
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 @dataclass
 class BlenderConnection:
     host: str
     port: int
     sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
-    
+    # Serializes send+receive so two commands can never interleave on one socket.
+    # Without this, a second command's response can be read as the first's, and
+    # the stream stays desynced until the 180s timeout fires.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
     def connect(self) -> bool:
         """Connect to the Blender addon socket server"""
         if self.sock:
@@ -40,11 +59,16 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(3.0)
             self.sock.connect((self.host, self.port))
+            self.sock.settimeout(None)
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Blender: {str(e)}")
+            if self.sock:
+                with suppress(Exception):
+                    self.sock.close()
             self.sock = None
             return False
     
@@ -58,109 +82,56 @@ class BlenderConnection:
             finally:
                 self.sock = None
 
-    def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
-        
-        try:
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        # If we get an empty chunk, the connection might be closed
-                        if not chunks:  # If we haven't received anything yet, this is an error
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        continue
-                except socket.timeout:
-                    # If we hit a timeout during receiving, break the loop and try to use what we have
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        # Try to use what we have
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
-            try:
-                # Try to parse what we have
-                json.loads(data.decode('utf-8'))
-                return data
-            except json.JSONDecodeError:
-                # If we can't parse it, it's incomplete
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
-
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Blender and return the response"""
+        # Hold the lock across send+receive: frames are ordered on one stream.
+        with self._lock:
+            return self._send_command_locked(command_type, params)
+
+    def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Blender")
-        
+
         command = {
             "type": command_type,
             "params": params or {}
         }
-        
+
         try:
-            # Log the command being sent
             logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
-            
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
+            self.sock.sendall(pack_json_message(command))
+            logger.info("Command sent, waiting for framed response...")
+
+            response_data = receive_framed_bytes(self.sock, timeout=180.0)
             logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
+
+            response = json.loads(response_data.decode("utf-8"))
             logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
+
             if response.get("status") == "error":
                 logger.error(f"Blender error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Blender"))
-            
+                raise BlenderCommandError(response.get("message", "Unknown error from Blender"))
+
             return response.get("result", {})
+        except BlenderCommandError:
+            # Addon answered — do not drop the socket or wrap as transport failure.
+            raise
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
             self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request. If Blender is running headless (blender -b), commands never execute; run Blender with a GUI or via 'xvfb-run -a blender' instead")
+            raise Exception(
+                "Timeout waiting for Blender response - try simplifying your request. "
+                "In GUI mode ensure the addon is connected. In blender -b, use a current "
+                "addon that runs the server loop on the main thread. Also ensure addon "
+                "and server versions match (length-prefixed socket protocol)."
+            )
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
             self.sock = None
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
+            if "response_data" in locals() and response_data:
                 logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
             raise Exception(f"Invalid response from Blender: {str(e)}")
         except Exception as e:
@@ -179,22 +150,20 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
 
-        # Record startup event for telemetry
+        # Telemetry startup (non-blocking queue)
         try:
             record_startup()
         except Exception as e:
             logger.debug(f"Failed to record startup telemetry: {e}")
 
-        # Try to connect to Blender on startup to verify it's available
-        try:
-            # This will initialize the global connection if needed
-            blender = get_blender_connection()
-            logger.info("Successfully connected to Blender on startup")
-        except Exception as e:
-            logger.warning(f"Could not connect to Blender on startup: {str(e)}")
-            logger.warning("Make sure the Blender addon is running before using Blender resources or tools")
+        # Do NOT connect to Blender during MCP handshake. Connecting here blocks
+        # client startup when Blender is closed and can take down the whole host.
+        # Tools connect lazily via get_blender_connection().
+        logger.info(
+            "Blender connection is deferred until the first tool call "
+            "(start the BlenderMCP addon when ready)"
+        )
 
-        # Return an empty context - we're using the global connection
         yield {}
     finally:
         # Clean up the global connection on shutdown
@@ -215,56 +184,60 @@ mcp = FastMCP(
 
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
 
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
-    if _blender_connection is not None:
-        try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
-            return _blender_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _blender_connection.disconnect()
-            except:
-                pass
-            _blender_connection = None
-    
+    global _blender_connection
+
+    # Reuse the existing connection. We deliberately do NOT probe it with a
+    # command here: that put two commands on the wire for every tool call, and
+    # any overlap desynced the response stream until the socket timeout fired.
+    # A dead socket is detected by the next real command and reconnected then.
+    if _blender_connection is not None and _blender_connection.sock is not None:
+        return _blender_connection
+
     # Create a new connection if needed
     if _blender_connection is None:
-        host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+        host = os.getenv("BLENDER_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
         port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-        _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
-    
+        # Try configured host, then common localhost aliases (WSL/docker/devcontainers)
+        candidates = [host]
+        if host in ("localhost", "127.0.0.1"):
+            candidates = ["127.0.0.1", "localhost"]
+        elif host in ("host.docker.internal",):
+            candidates = [host, "172.17.0.1"]
+        last_err = None
+        for h in candidates:
+            conn = BlenderConnection(host=h, port=port)
+            if conn.connect():
+                _blender_connection = conn
+                logger.info("Created new persistent connection to Blender at %s:%s", h, port)
+                return _blender_connection
+            last_err = h
+        logger.error("Failed to connect to Blender (tried %s)", candidates)
+        _blender_connection = None
+        raise Exception(
+            "Could not connect to Blender. Start the BlenderMCP addon, and set "
+            f"BLENDER_HOST if needed (tried {candidates}; last={last_err})."
+        )
+
     return _blender_connection
 
 
 @mcp.tool()
 @telemetry_tool("get_scene_info")
-def get_scene_info(ctx: Context, user_prompt: str) -> str:
-    """Get detailed information about the current Blender scene
+def get_scene_info(ctx: Context, user_prompt: str = "") -> str:
+    """Get detailed information about the current Blender scene.
+
+    Includes blender_version and blender_version_string for API branching.
 
     Parameters:
-    - user_prompt: The original user prompt that led to this tool call (required for telemetry)
+    - user_prompt: Optional original user prompt (telemetry)
     """
     try:
         blender = get_blender_connection()
         result = blender.send_command("get_scene_info")
 
-        # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting scene info from Blender: {str(e)}")
@@ -308,29 +281,26 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
     
     try:
         blender = get_blender_connection()
-        
-        # Create temp file path
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
-        
+
         result = blender.send_command("get_viewport_screenshot", {
             "max_size": max_size,
-            "filepath": temp_path,
-            "format": "png"
+            "format": "png",
         })
-        
+
         if "error" in result:
             raise Exception(result["error"])
-        
-        if not os.path.exists(temp_path):
-            raise Exception("Screenshot file was not created")
-        
-        # Read the file
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
-        
-        # Delete the temp file
-        os.remove(temp_path)
+
+        # Prefer base64 from Blender (works across WSL / remote MCP hosts)
+        if result.get("image_base64"):
+            image_bytes = base64.b64decode(result["image_base64"])
+        else:
+            temp_path = result.get("filepath") or ""
+            if not temp_path or not os.path.exists(temp_path):
+                raise Exception("Screenshot data was not returned by Blender")
+            with open(temp_path, "rb") as f:
+                image_bytes = f.read()
+            with suppress(Exception):
+                os.remove(temp_path)
         
         # Upload to storage for telemetry
         try:
@@ -372,22 +342,46 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str
 
 @mcp.tool()
 @rich_telemetry_tool("execute_blender_code", capture_code=True)
-def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
+def execute_blender_code(
+    ctx: Context,
+    code: str = "",
+    file_path: str = "",
+    user_prompt: str = "",
+) -> str:
     """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
+    Execute arbitrary Python code in Blender. Prefer small steps.
+
+    Pass either inline `code` or `file_path` to a local .py file (server reads
+    the file — cheaper than large inlined scripts). If both are set, `code` wins.
 
     Parameters:
-    - code: The Python code to execute
-    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    - code: Python source to execute (optional if file_path is set)
+    - file_path: Path to a local Python file (absolute or relative to server cwd)
+    - user_prompt: Original user prompt (telemetry)
     """
     try:
-        # Get the global connection
+        if code:
+            source = code
+        elif file_path:
+            path = Path(file_path)
+            if not path.is_file():
+                return f"Error executing code: file not found at {file_path}"
+            source = path.read_text(encoding="utf-8")
+        else:
+            return "Error executing code: provide code or file_path"
         blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
+        result = blender.send_command("execute_code", {"code": source})
         return f"Code executed successfully: {result.get('result', '')}"
+    except BlenderCommandError as e:
+        msg = str(e)
+        prefix = "Code execution error: "
+        if msg.startswith(prefix):
+            msg = msg[len(prefix):]
+        logger.info(f"Blender Python error: {msg}")
+        return f"Blender Python error: {msg}"
     except Exception as e:
-        logger.error(f"Error executing code: {str(e)}")
-        return f"Error executing code: {str(e)}"
+        logger.error(f"Communication error executing code: {str(e)}")
+        return f"Communication error: {str(e)}"
 
 @mcp.tool()
 @telemetry_tool("get_polyhaven_categories")
@@ -401,7 +395,8 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris", user_promp
     """
     try:
         blender = get_blender_connection()
-        if not _polyhaven_enabled:
+        status = blender.send_command("get_polyhaven_status")
+        if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
         
@@ -915,7 +910,7 @@ def generate_hyper3d_model_via_images(
                     (Path(path).suffix, base64.b64encode(f.read()).decode("ascii"))
                 )
     elif input_image_urls is not None:
-        if not all(urlparse(i) for i in input_image_paths):
+        if not all(_is_valid_http_url(i) for i in input_image_urls):
             return "Error: not all image URLs are valid!"
         images = input_image_urls.copy()
     try:
@@ -1231,10 +1226,15 @@ def asset_creation_strategy() -> str:
 
 def main():
     """Run the MCP server"""
+    # Avoid UnicodeEncodeError on Windows consoles with legacy code pages.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     # When run by hand (stdin is a TTY) the server appears to "hang" while it
     # silently waits for an MCP client; log a hint so that state is obvious.
-    # Launched by a client, stdin is a pipe so this is skipped, and logging goes
-    # to stderr, never to the stdio protocol on stdout.
     try:
         interactive = sys.stdin.isatty()
     except (AttributeError, OSError):
@@ -1245,7 +1245,7 @@ def main():
             "client (Claude Desktop, Cursor, VS Code, ...), not run by hand. "
             "It will now wait silently for a client on stdin -- that is normal, "
             "not a hang. Press Ctrl-C to exit. "
-            "Setup guide: https://github.com/ahujasid/blender-mcp#installation"
+            "Setup guide: https://github.com/MCPBlender/blender-mcp#installation"
         )
     mcp.run()
 
